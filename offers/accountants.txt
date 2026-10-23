@@ -1,5 +1,4 @@
-Done-for-you client document intake automation for small accounting/bookkeeping firms.
-Clients' receipts and invoices are collected (email/WhatsApp/upload), read by AI, and
-delivered as clean, categorized, bookkeeping-ready data -- no manual chasing or retyping.
-Pilot: fixed price USD 300, one month, up to 3 of the firm's clients, results or no charge
-for the second month.
+PROBLEM: small accounting/bookkeeping firms lose hours each week chasing clients for receipts and retyping invoices.
+DELIVERABLE: client receipts and invoices are collected, read by AI, and handed back as clean, categorized, bookkeeping-ready data.
+FIRST STEP: free trial on one client's week of documents (max 20). A sample output is available first.
+PRICE (never mention in first messages or follow-ups): if they continue, USD 300 for a one-month pilot with up to 3 clients; second month free if it doesn't deliver.

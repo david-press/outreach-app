@@ -7,6 +7,31 @@ st.set_page_config(page_title="Outreach", page_icon="📬", layout="centered")
 st.title("📬 Outreach")
 
 # ------------------------------------------------------------ sidebar: find + draft
+def _job_status():
+    j = o.JOB
+    if j["running"]:
+        st.session_state["was_running"] = True
+        if j["total"]:
+            st.progress(min(j["done"] / j["total"], 1.0),
+                        text=f"{j['stage']}... {j['done']}/{j['total']} (drafts appear as they finish)")
+        else:
+            st.progress(0.0, text=f"{j['stage']}...")
+        if j["done"] != st.session_state.get("seen_done"):
+            st.session_state["seen_done"] = j["done"]
+            st.rerun()
+    else:
+        if st.session_state.pop("was_running", False):
+            st.rerun()
+        if j["error"]:
+            st.error(j["error"])
+        elif j["found"] == 0 and not j.get("drafted"):
+            st.warning("No new businesses with contact details found. Try another city or type.")
+        if j["timings"]:
+            st.caption("Time: " + " · ".join(f"{k} {v}s" for k, v in j["timings"].items()))
+
+
+job_status = st.fragment(run_every=1.5 if o.JOB["running"] else None)(_job_status)
+
 with st.sidebar:
     st.header("Find new prospects")
     if not o.has_key():
@@ -15,31 +40,51 @@ with st.sidebar:
     segment = st.text_input("Business type", "restaurants",
                             help="Pick one: " + ", ".join(o.SEGMENTS) + ". Or a raw tag like tag:amenity=bar")
     try:
-        seg_name, _ = o.resolve_segment(segment)
+        seg_name, _ = o.segment_for(segment)
     except ValueError as e:
         seg_name = ""
         st.warning(str(e))
-    limit = st.number_input("How many businesses", 5, 100, 15, help="15 is plenty for a day. More = slower (free AI rate limits).")
-    if st.button("Find & draft messages", type="primary"):
-        try:
-            bar = st.progress(0.0, text="Finding businesses on the map...")
-            n = o.cmd_source(place, segment, "", int(limit))
-            if n:
-                o.cmd_generate(progress=lambda d, t: bar.progress(d / t, text=f"Researching + drafting {d}/{t}"))
-            bar.empty()
-            if n == 0:
-                st.warning("No new businesses with contact details found. Try another city or type.")
-            else:
-                st.rerun()
-        except Exception as e:
-            st.error(str(e))
+    limit = st.number_input("How many to draft now", 3, 40, 10, help="Draft what you'll send today. Fewer = faster.")
+    clear_first = st.checkbox("Clear unsent queue first (new session)", True)
+    st.caption("Source: " + o.source_name())
+    st.caption(f"AI: {' → '.join(o.MODELS)} (auto-detected from Groq at run time)")
+    if st.button("🔌 Test my keys"):
+        for line in o.check_keys():
+            st.write(("✅ " if ": OK" in line else "⚠️ ") + line)
+    if st.button("Find & draft messages", type="primary", disabled=o.JOB["running"]):
+        if not o.has_key():
+            st.error("Add your GROQ_API_KEY to the .env file first.")
+        elif o.start_job(place, segment, int(limit), clear_first):
+            st.session_state["seen_done"] = -1
+            st.rerun()
+    job_status()
+    if st.button("🧹 Clear unsent queue", disabled=o.JOB["running"]):
+        st.toast(f"Cleared {o.reset_queue()} unsent. History and follow-ups kept.")
+        st.rerun()
     st.caption(f"Daily send cap: {o.DAILY_CAP}")
-    with st.expander(f"✏️ Edit my offer for: {seg_name or 'general'}"):
-        if seg_name and not o.has_segment_offer(seg_name):
-            st.warning(f"No saved offer for '{seg_name}' yet. Write one before drafting.")
-        new_offer = st.text_area("What you're selling here (price + terms)", o.get_offer(seg_name), height=220)
+    # keep the offer editor in sync with the chosen business type
+    if st.session_state.get("offer_seg") != seg_name:
+        st.session_state["offer_seg"] = seg_name
+        st.session_state["offer_edit"] = o.get_offer(seg_name)
+        st.session_state["gaps"] = []
+
+    def _structure():
+        try:
+            txt, gaps = o.structure_offer(st.session_state["raw_offer"], seg_name)
+            st.session_state["offer_edit"], st.session_state["gaps"] = txt, gaps
+        except Exception as e:
+            st.session_state["gaps"] = [f"Could not structure it: {e}"]
+
+    with st.expander(f"✏️ Offer for: {seg_name or 'general'}", expanded=not o.has_segment_offer(seg_name)):
+        st.text_area("Describe what you sell or want to achieve (rough is fine)", key="raw_offer", height=120,
+                     placeholder="e.g. I build AI tools that turn receipts into expense sheets. I want small shops to try it free for a week.")
+        st.button("✨ Structure it", on_click=_structure)
+        for g in st.session_state.get("gaps", []):
+            st.warning(g)
+        st.text_area("Structured offer (edit freely)", key="offer_edit", height=260)
         if st.button("Save offer"):
-            o.save_offer(new_offer, seg_name); st.success("Saved. Applies to the next drafts.")
+            o.save_offer(st.session_state["offer_edit"], seg_name)
+            st.success("Saved. Applies to the next drafts.")
 
 rows = o.load()
 today = str(dt.date.today())
@@ -93,7 +138,8 @@ with t2:
 
 # ------------------------------------------------------------ pipeline
 with t3:
-    contacted = [r for r in rows if r["sent_date"]]
+    show_all = st.toggle("Show closed / older", False)
+    contacted = [r for r in rows if r["sent_date"] and (show_all or r["status"] in ("sent", "replied", "call"))]
     st.caption("Update a prospect when they reply.")
     for r in contacted:
         c1, c2, c3 = st.columns([3, 2, 1])
@@ -119,3 +165,8 @@ with t4:
     c.metric("Calls", len(calls))
     d.metric("Won", len(won))
     st.caption("After 50 sends: under 2% reply = fix the offer/targeting, not volume. 2-5% normal. Over 5% scale.")
+    if touched:
+        st.subheader("What's working")
+        st.caption("Variant A leads with the problem, B leads with the result. Keep the winner once each has 25+ sends.")
+        st.table(o.stats_by(rows, "variant"))
+        st.table(o.stats_by(rows, "segment"))

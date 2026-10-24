@@ -281,6 +281,8 @@ def google_provider():
 
 
 def source_name():
+    if has_serper() and has_serpapi():
+        return "Google Maps data (Serper first, SerpApi as automatic backup, then OpenStreetMap)"
     return {"serper": "Google Maps data (Serper)", "serpapi": "Google Maps data (SerpApi)",
             "osm": "OpenStreetMap (free, thinner data). Add a Serper or SerpApi key in .env for Google Maps data."}[google_provider()]
 
@@ -341,7 +343,7 @@ def check_keys():
     else:
         out.append("SerpApi: no key set")
     if has_serper() and has_serpapi():
-        out.append("Note: both set, so Serper is used. Clear SERPER_API_KEY to use SerpApi.")
+        out.append("Both keys set: Serper is tried first, SerpApi is the automatic backup.")
     out.append("Active map source: " + source_name())
     return out
 
@@ -448,11 +450,18 @@ def cmd_source(place, segment, country="", limit=40):
     ekey = f"{gkey}|{seg_name}|{provider}"
     els = cache_get("els", ekey, 86400)  # repeat searches within 24h are instant
     if els is None:
-        if use_serper:
-            fn = serper_elements if provider == "serper" else serpapi_elements
-            els = fn(place, segment, cc, int(limit) * 2)
-            cache_put("els", ekey, els)
-        else:
+        for prov in (["serper"] if has_serper() else []) + (["serpapi"] if has_serpapi() else []):
+            try:
+                els = (serper_elements if prov == "serper" else serpapi_elements)(place, segment, cc, int(limit) * 2)
+                cache_put("els", ekey, els)
+                provider = prov
+                break
+            except Exception as e:  # out of credits, bad key, outage: try the next source
+                print(f"  {prov} failed: {str(e)[:100]}; trying the next source")
+        if els is None:
+            if geo.get("bbox") is None:
+                raise RuntimeError("Google Maps sources failed and the place could not be looked up for the free map. Try again in a minute.")
+            provider = "osm"
             s_, n_, w_, e_ = geo["bbox"]
             contact = ["phone", "website", "email", "contact:phone", "contact:website", "contact:email"]
             body = "".join(f'nwr["{k}"~"^({v})$"]["{c}"]({s_},{w_},{n_},{e_});'

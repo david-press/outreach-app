@@ -1,0 +1,5 @@
+PROBLEM: small business owners lose hours each week typing receipts and supplier invoices into spreadsheets.
+DELIVERABLE: they send photos of receipts/invoices and get back a clean, categorized weekly expense sheet.
+FIRST STEP: free trial on one week of their receipts (max 20); a sample sheet is available first.
+PRICE (never mention in first messages): if they continue, USD 300 for a one-month pilot; second month free if it doesn't deliver.
+(Edit this for each business type in the app: one problem, one deliverable, one small free step.)

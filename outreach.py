@@ -518,11 +518,11 @@ def parse_pages(htmls, url):
         emails += EMAIL_RE.findall(html)
         t = re.sub(r"(?is)<(script|style|noscript).*?</\1>", " ", html)
         t = re.sub(r"(?s)<[^>]+>", " ", t)
-        texts.append(re.sub(r"\s+", " ", t).strip()[:800])
+        texts.append(re.sub(r"\s+", " ", t).strip()[:500])
     d = domain_of(url)
     clean = [m.lower() for m in emails if not any(b in m.lower() for b in BAD_EMAIL)]
     clean.sort(key=lambda m: (d not in m, m.startswith(("info@", "contact@", "hello@", "office@"))))
-    return " ".join(texts)[:2200], list(dict.fromkeys(clean))
+    return " ".join(texts)[:1300], list(dict.fromkeys(clean))
 
 
 async def afetch_site(http, url):
@@ -551,34 +551,29 @@ async def afetch_site(http, url):
     return text, emails
 
 
-PROMPT = """You are a cold-outreach copywriter. Your ONLY objective: maximize the probability that THIS recipient replies positively. Optimize for the recipient's psychology, never for the sender's taste.
-
-Sender: {sender}
-OFFER (structured; the GOAL line defines what a positive reply means, CTA is the closing question):
+PROMPT = """Write a cold message that maximizes the chance THIS recipient replies positively. Sender: {sender}.
+OFFER (GOAL = what a positive reply means; CTA = closing question):
 {offer}
+RECIPIENT: {firm} ({segment}), {place}. Contact: {name} {role}
+SITE_TEXT (only source of truth; may be empty): {site}
+Language: {lang} (use the site's language if it is clearly different). Style: {variant_style}
+Rules:
+1. Line 1 is about THEM: one true observation from SITE_TEXT, using their exact product words. If SITE_TEXT is thin, mention only the business type and place.
+2. One problem, in the owner's words, tied to their business. Sell the outcome. No jargon ('AI', 'automation', 'platform', 'solution').
+3. Include the offer's FIRST STEP with its limit. Use PROOF only if the offer states it. Never invent clients, numbers or claims like 'most owners'.
+4. End with the offer's CTA: exactly one question mark, answerable in one word. No call/calendar ask unless GOAL says so.
+5. email_body: max 75 words, plain text, no links/emojis/flattery. Greeting 'Hi <first name>,' else 'Hi <business name> team,'. Sign off {sender}. If no contact name, add one short line asking who handles this.
+6. Price only if the offer's PRICE says INCLUDE in first message; otherwise never mention it.
+7. subject: max 5 words, lowercase, specific. whatsapp_msg: max 45 words, conversational, same first step and CTA, no links.
+contact_name/contact_role only if explicitly named in SITE_TEXT, else "". hook = the observation you used (thin site: business type and place, and fit_score max 3). fit_score 1-5 = likelihood this business has the problem the offer solves.
+Return ONLY JSON with keys: contact_name, contact_role, fit_score, hook, subject, email_body, whatsapp_msg."""
 
-RECIPIENT: {firm} ({segment}), {place}. Known contact: {name} {role}
-SITE_TEXT (only source of truth about them; may be thin or empty): {site}
-Language: write all messages in {lang}, unless SITE_TEXT is clearly in another language, then use that one.
-Style variant: {variant_style}
-
-Principles (follow strictly):
-1. Relevance first. The first sentence is about THEM: one specific, true observation from SITE_TEXT (exact product/service words, never mislabel). If SITE_TEXT is thin, use only the business type and place and do not pretend you studied them.
-2. One problem only, phrased the way their owner would say it, tied to their business context. No feature lists.
-3. Sell the outcome, not the tool. No jargon: avoid 'AI', 'automation', 'platform', 'solution', 'leverage' unless the offer itself requires it.
-4. Remove risk. Include the offer's FIRST STEP with its limit, so replying costs them nothing.
-5. Credibility only from the offer's PROOF line. NEVER invent clients, numbers, statistics, or claims like 'most owners'. If PROOF is none, imply no proof.
-6. Exactly one low-effort call to action, answerable in one word, ending the message (use the offer's CTA). Exactly one question mark. Do not ask for a call or calendar slot unless the offer's GOAL/CTA says so.
-7. Brevity: email_body max 75 words, plain text, no links, no attachments, no emojis, no flattery, no 'hope this finds you well'. Sign off with the sender name.
-8. Greeting: 'Hi <first name>,' if known, else 'Hi <business name> team,'. If no contact name is known and words allow, add one short line asking who handles this.
-9. Price: state it only if the offer's PRICE line says INCLUDE in first message; otherwise never mention price in any message.
-10. subject: max 5 words, lowercase, specific to them, no hype, no clickbait.
-11. whatsapp_msg: max 45 words, conversational, names the business, same first step and CTA, no price unless allowed, no links.
-12. followup1 (max 45 words, no 'just checking in'): add a NEW angle or one concrete example of the result. followup2 (max 35 words): a polite close-the-loop that makes saying no easy.
-- contact_name/contact_role: if no known contact, give an owner/manager/founder ONLY if explicitly named in SITE_TEXT, else "".
-- hook = the specific observation you used. If SITE_TEXT is thin, hook = what kind of business it is and where, and fit_score is at most 3.
-- fit_score 1-5: likelihood this business has the problem the offer solves, given its type and size (5 = clear recurring pain; 1 = irrelevant).
-Return ONLY JSON with keys: contact_name, contact_role, fit_score, hook, subject, email_body, whatsapp_msg, followup1, followup2."""
+FOLLOWUP_PROMPT = """Write follow-up #{n} for a cold message that got no reply. Language: {lang}. Sender: {sender}.
+ORIGINAL EMAIL: {email}
+OFFER: {offer}
+Follow-up 1 (max 45 words): add ONE new angle or a concrete example of the result; never 'just checking in'; keep the same closing question; no price unless the offer says to include it.
+Follow-up 2 (max 35 words): a polite close-the-loop that makes saying no easy.
+Plain text, sign off {sender}. Return ONLY JSON: {{"text": "..."}}"""
 
 VARIANTS = {
     "A": "PROBLEM-LED: open with the specific problem this business likely has, then the fix, then the first step.",
@@ -714,30 +709,88 @@ def _retry_after(e):
         return 0
 
 
+TPM_LIMIT = int(os.getenv("GROQ_TPM", "7000"))  # free plan allows 8,000 tokens/min per model; keep a margin
+WINDOW = 60
+_USAGE = {}
+_RR = {"i": 0}
+
+
+def _used(model):
+    now = time.time()
+    _USAGE[model] = [e for e in _USAGE.get(model, []) if now - e[0] < WINDOW]
+    return sum(e[1] for e in _USAGE[model])
+
+
+def _reserve(est):
+    """Pick (round-robin) a model that still has room in this minute and reserve tokens on it."""
+    n = len(MODELS)
+    for k in range(n):
+        m = MODELS[(_RR["i"] + k) % n]
+        if _used(m) + est <= TPM_LIMIT:
+            entry = [time.time(), est]
+            _USAGE.setdefault(m, []).append(entry)
+            _RR["i"] = (_RR["i"] + k + 1) % n
+            return m, entry
+    return None, None
+
+
 async def adraft(p, site, sem, ac):
     prompt = build_prompt(p, site)
-    async with sem:  # holding the slot while waiting also throttles everyone on a rate limit
-        for attempt in range(8):
+    est = len(prompt) // 3 + 450  # input tokens + expected output
+    deadline, fails = time.time() + 180, 0
+    async with sem:
+        while time.time() < deadline and fails < 5:
             if not MODELS:
                 LAST_AI_ERROR["msg"] = "No AI model available for this Groq key."
                 return None
-            model = MODELS[attempt % len(MODELS)]
+            model, entry = _reserve(est)
+            if model is None:  # every model used its per-minute budget: wait for the window to roll
+                await asyncio.sleep(2)
+                continue
             try:
                 r = await ac.chat.completions.create(**_chat_kwargs(model, prompt, 0.4))
+                u = getattr(r, "usage", None)
+                if u is not None and getattr(u, "total_tokens", None):
+                    entry[1] = u.total_tokens
                 return _parse_json(r.choices[0].message.content)
             except Exception as e:
                 msg = str(e).lower()
                 LAST_AI_ERROR["msg"] = str(e)[:200]
                 print(f"  {model}: {str(e)[:80]}")
                 if _model_gone(msg):
+                    entry[1] = 0
                     if model in MODELS and len(MODELS) > 1:
                         MODELS.remove(model)  # retired model: drop it and move on
+                    else:
+                        fails += 1
                     continue
-                limited = "429" in msg or "rate" in msg
-                if limited and attempt < len(MODELS) - 1:
-                    continue  # each model has its own limit: switch instantly
-                await asyncio.sleep(min(_retry_after(e) or 6 * (attempt + 1), 20) if limited else 2)
+                if "429" in msg or "rate" in msg:
+                    # this model is full: park it until its window rolls, use the others meanwhile
+                    entry[0], entry[1] = time.time() - WINDOW + max(_retry_after(e), 5), TPM_LIMIT
+                    continue
+                entry[1] = 0
+                fails += 1
+                await asyncio.sleep(2)
     return None
+
+
+def make_followup(row, n):
+    """Write follow-up n+1 only when it is due (saves AI quota). Saved so it is written once."""
+    prompt = FOLLOWUP_PROMPT.format(n=n + 1, lang=LANG.get((row.get("country") or "").upper(), "English"),
+                                    sender=SENDER, email=row.get("email_body", ""),
+                                    offer=get_offer(row.get("segment", "")))
+    try:
+        text = str((chat_json(prompt, 0.4) or {}).get("text", "")).strip()
+    except Exception as e:
+        print("  follow-up failed:", str(e)[:100])
+        return ""
+    if text:
+        rows = load()
+        for r in rows:
+            if r["id"] == row["id"]:
+                r["followup1" if n == 0 else "followup2"] = text
+        save(rows)
+    return text
 
 
 # ------------------------------------------------------------------ DB
@@ -797,7 +850,7 @@ async def _pipeline(todo, rows, progress):
                     "sent_date": "", "followups_sent": "0", "next_action": ""}
             if not (email or phone):
                 return {**base, "fit_score": "1", "status": "nofit"}
-            d = await adraft(p, (site + (" INFO: " + info if info else "")).strip(), lsem, ac)
+            d = await adraft(p, (site[:1300] + (" INFO: " + info if info else "")).strip(), lsem, ac)
             if not d:
                 return None
             subj, body, wa = d.get("subject", ""), d.get("email_body", ""), d.get("whatsapp_msg", "")

@@ -48,6 +48,7 @@ with st.sidebar:
     clear_first = st.checkbox("Clear unsent queue first (new session)", True)
     st.caption("Source: " + o.source_name())
     st.caption(f"AI: {' → '.join(o.MODELS)} (auto-detected from Groq at run time)")
+    st.caption("Free Groq plan: ~8K tokens/min and 200K/day per model. The app paces itself and alternates models.")
     if st.button("🔌 Test my keys"):
         for line in o.check_keys():
             st.write(("✅ " if ": OK" in line else "⚠️ ") + line)
@@ -127,6 +128,9 @@ with t2:
     for r in due:
         n = int(r["followups_sent"] or 0)
         text = r["followup1"] if n == 0 else r["followup2"]
+        if not text:
+            with st.spinner("Writing follow-up..."):
+                text = o.make_followup(r, n)
         with st.expander(f"{r['firm_name']}  ·  follow-up {n + 1}"):
             msg = st.text_area("Message", text, height=120, key=f"f{r['id']}")
             if r["email"]:

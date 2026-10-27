@@ -9,7 +9,7 @@ CLI:
   python outreach.py generate
   python outreach.py today | sent <id> | mark <id> <status> | stats | segments
 """
-import asyncio, csv, hashlib, json, os, re, sys, threading, time, datetime as dt
+import asyncio, base64, csv, hashlib, io, json, os, re, sys, threading, time, datetime as dt
 from pathlib import Path
 from urllib.parse import quote, urlparse
 import httpx
@@ -22,34 +22,170 @@ BASE = Path(__file__).parent
 load_dotenv(BASE / ".env", override=True)  # the .env file wins over stray system variables
 
 
+def _env(name, default=""):
+    """A setting from .env / environment, or from Streamlit Cloud 'Secrets'."""
+    v = os.getenv(name, "")
+    if not v:
+        try:
+            import streamlit as st
+            v = str(st.secrets.get(name, ""))
+        except Exception:
+            v = ""
+    return v or default
+
+
 def _env_key(name):
     """Read a key and clean accidental spaces/quotes (a common cause of 'invalid key')."""
-    return os.getenv(name, "").strip().strip("'\"").strip()
+    return _env(name).strip().strip("'\"").strip()
+
+
 (BASE / "data").mkdir(exist_ok=True)
 (BASE / "offers").mkdir(exist_ok=True)
 
+try:
+    from zoneinfo import ZoneInfo
+    TZ = ZoneInfo(_env("APP_TZ", "Africa/Lagos"))  # cloud servers run on UTC; your day should follow your clock
+except Exception:
+    TZ = dt.timezone.utc
+
+
+def now():
+    return dt.datetime.now(TZ)
+
+
+class LocalStore:
+    """Files on this computer. On a cloud host these are ERASED on every restart."""
+    kind = "local disk"
+
+    def _p(self, name):
+        return BASE / name if name.startswith("offers/") else BASE / "data" / name
+
+    def read(self, name):
+        p = self._p(name)
+        if not p.exists():
+            return None
+        with open(p, newline="", encoding="utf-8") as f:
+            return f.read()
+
+    def write(self, name, text):
+        p = self._p(name)
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_suffix(p.suffix + ".tmp")
+        with open(tmp, "w", newline="", encoding="utf-8") as f:
+            f.write(text)
+        for _ in range(10):  # Windows can briefly lock a file while another thread reads it
+            try:
+                os.replace(tmp, p)
+                return
+            except PermissionError:
+                time.sleep(0.1)
+        os.replace(tmp, p)
+
+    def delete(self, name):
+        p = self._p(name)
+        if p.exists():
+            p.unlink()
+
+
+class GitHubStore:
+    """Permanent storage in a PRIVATE GitHub repo (one commit per save). Reads are cached in memory."""
+    kind = "GitHub"
+
+    def __init__(self, token, repo, branch="main"):
+        self.repo, self.branch = repo, branch
+        self.h = {"Authorization": f"Bearer {token}", "Accept": "application/vnd.github+json",
+                  "X-GitHub-Api-Version": "2022-11-28"}
+        self.base = f"https://api.github.com/repos/{repo}/contents/"
+        self.mem = {}  # name -> (text or None, sha or None)
+
+    def _fetch(self, name):
+        r = requests.get(self.base + quote(name), headers=self.h, params={"ref": self.branch}, timeout=25)
+        if r.status_code == 404:
+            return None, None
+        if r.status_code in (401, 403):
+            raise RuntimeError(f"GitHub storage rejected the token ({r.status_code}). Check DATA_GITHUB_TOKEN and DATA_GITHUB_REPO.")
+        r.raise_for_status()
+        j = r.json()
+        if j.get("content") and j.get("encoding") == "base64":
+            raw = j["content"]
+        else:  # files over 1 MB come back empty here: fetch the blob instead
+            br = requests.get(f"https://api.github.com/repos/{self.repo}/git/blobs/{j['sha']}", headers=self.h, timeout=40)
+            br.raise_for_status()
+            raw = br.json()["content"]
+        return base64.b64decode(raw).decode("utf-8"), j["sha"]
+
+    def read(self, name):
+        if name not in self.mem:
+            self.mem[name] = self._fetch(name)
+        return self.mem[name][0] or None
+
+    def write(self, name, text):
+        if name not in self.mem:
+            self.mem[name] = self._fetch(name)
+        body = {"message": f"update {name}", "branch": self.branch,
+                "content": base64.b64encode(text.encode("utf-8")).decode()}
+        for attempt in range(2):
+            sha = self.mem[name][1]
+            if sha:
+                body["sha"] = sha
+            else:
+                body.pop("sha", None)
+            r = requests.put(self.base + quote(name), headers=self.h, json=body, timeout=40)
+            if r.status_code in (409, 422) and attempt == 0:  # changed elsewhere: refresh the version tag, retry once
+                self.mem[name] = self._fetch(name)
+                continue
+            if r.status_code in (401, 403, 404):
+                raise RuntimeError(f"GitHub storage cannot write ({r.status_code}). The token needs 'Contents: read and write' on the data repo.")
+            r.raise_for_status()
+            self.mem[name] = (text, r.json()["content"]["sha"])
+            return
+
+    def delete(self, name):
+        self.write(name, "")
+
+
+def _make_store():
+    tok, repo = _env_key("DATA_GITHUB_TOKEN"), _env_key("DATA_GITHUB_REPO")
+    return GitHubStore(tok, repo, _env("DATA_GITHUB_BRANCH", "main")) if tok and repo else LocalStore()
+
+
+STORE = _make_store()
+DBLOCK = threading.RLock()  # every change to the sent-log goes through this, so taps and background drafting never overwrite each other
+
 # Groq changes its model catalog often, so the app asks Groq which models this key can use (live_models).
 PREFERRED = ["openai/gpt-oss-120b", "openai/gpt-oss-20b", "qwen/qwen3.6-27b"]
-MODELS = [m.strip() for m in os.getenv("OUTREACH_MODELS", "").split(",") if m.strip()] or list(PREFERRED)
+MODELS = [m.strip() for m in _env("OUTREACH_MODELS", "").split(",") if m.strip()] or list(PREFERRED)
 MODEL = MODELS[0]
 LAST_AI_ERROR = {"msg": ""}
 _LIVE = {"done": False}
-DB = BASE / "data" / "outreach.csv"
-PROSPECTS = BASE / "data" / "prospects.csv"
-OFFER_FILE = BASE / "offer.txt"
+DB = "outreach.csv"
+PROSPECTS = "prospects.csv"
+OFFER_FILE = "offer.txt"
 OFFERS_DIR = BASE / "offers"
-DAILY_CAP = int(os.getenv("DAILY_CAP", "15"))
-SENDER = os.getenv("SENDER_NAME", "Krish")
+DAILY_CAP = int(_env("DAILY_CAP", "15"))
+SETTINGS = "settings.json"
+
+
+def get_cap():
+    try:
+        return int(json.loads(STORE.read(SETTINGS) or "{}").get("daily_cap", DAILY_CAP))
+    except Exception:
+        return DAILY_CAP
+
+
+def set_cap(n):
+    STORE.write(SETTINGS, json.dumps({"daily_cap": int(n)}))
+SENDER = _env("SENDER_NAME", "David")
 FOLLOWUP_DAYS = (3, 8)
-FETCH_CONC = int(os.getenv("FETCH_CONCURRENCY", "30"))   # website fetches in flight
-LLM_CONC = int(os.getenv("LLM_CONCURRENCY", "5"))        # AI calls in flight
+FETCH_CONC = int(_env("FETCH_CONCURRENCY", "30"))   # website fetches in flight
+LLM_CONC = int(_env("LLM_CONCURRENCY", "5"))        # AI calls in flight
 
 SOURCE_FIELDS = ["firm_name", "website", "contact_name", "contact_role", "email", "phone",
                  "country", "address", "segment", "info"]
 FIELDS = ["id", "email", "phone", "firm_name", "segment", "variant", "contact_name", "contact_role",
           "country", "website", "info", "fit_score", "hook", "subject", "email_body",
           "whatsapp_msg", "followup1", "followup2", "mailto_link", "whatsapp_link", "status",
-          "sent_date", "followups_sent", "next_action"]
+          "sent_date", "followups_sent", "next_action", "last_logged"]
 
 UA = {"User-Agent": "OutreachApp/1.0 (small-business prospect research; personal use)"}
 EMAIL_RE = re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}")
@@ -68,22 +204,28 @@ def slug(text):
     return re.sub(r"\W+", "-", (text or "").lower()).strip("-") or "general"
 
 
+def _shipped(name):
+    p = BASE / name
+    return p.read_text(encoding="utf-8").strip() if p.exists() else None
+
+
 def get_offer(segment=""):
-    f = OFFERS_DIR / f"{slug(segment)}.txt"
-    if segment and f.exists():
-        return f.read_text(encoding="utf-8").strip()
-    if OFFER_FILE.exists():
-        return OFFER_FILE.read_text(encoding="utf-8").strip()
-    return DEFAULT_OFFER
+    if segment:
+        n = f"offers/{slug(segment)}.txt"
+        t = STORE.read(n) or _shipped(n)
+        if t and t.strip():
+            return t.strip()
+    t = STORE.read(OFFER_FILE)
+    return t.strip() if t and t.strip() else DEFAULT_OFFER
 
 
 def has_segment_offer(segment):
-    return (OFFERS_DIR / f"{slug(segment)}.txt").exists()
+    n = f"offers/{slug(segment)}.txt"
+    return bool((STORE.read(n) or _shipped(n) or "").strip())
 
 
 def save_offer(text, segment=""):
-    f = OFFERS_DIR / f"{slug(segment)}.txt" if segment else OFFER_FILE
-    f.write_text(text.strip(), encoding="utf-8")
+    STORE.write(f"offers/{slug(segment)}.txt" if segment else OFFER_FILE, text.strip())
 
 
 # ------------------------------------------------------------------ SEGMENTS
@@ -345,6 +487,11 @@ def check_keys():
     if has_serper() and has_serpapi():
         out.append("Both keys set: Serper is tried first, SerpApi is the automatic backup.")
     out.append("Active map source: " + source_name())
+    try:
+        STORE.read(SETTINGS)
+        out.append(f"Storage: OK ({STORE.kind}{' repo ' + STORE.repo if STORE.kind == 'GitHub' else ''})")
+    except Exception as e:
+        out.append(f"Storage: FAILED - {str(e)[:140]}")
     return out
 
 
@@ -422,8 +569,7 @@ def reset_queue():
             r["status"] = "archived"
             n += 1
     save(rows)
-    if PROSPECTS.exists():
-        PROSPECTS.unlink()
+    STORE.delete(PROSPECTS)
     return n
 
 
@@ -474,9 +620,8 @@ def cmd_source(place, segment, country="", limit=40):
                 print("Overpass unavailable, using Nominatim fallback:", str(err)[:120])
                 els = nominatim_fallback(place, seg_name)
     have = {(r["firm_name"].lower(), domain_of(r["website"])) for r in load()}
-    if PROSPECTS.exists():
-        with open(PROSPECTS, newline="", encoding="utf-8") as f:
-            have |= {(r["firm_name"].lower(), domain_of(r["website"])) for r in csv.DictReader(f)}
+    old_p = read_prospects()
+    have |= {(r["firm_name"].lower(), domain_of(r["website"])) for r in old_p}
     new = []
     for el in els:
         t = el.get("tags", {})
@@ -498,12 +643,7 @@ def cmd_source(place, segment, country="", limit=40):
                     "address": addr, "segment": seg_name, "info": info})
         if len(new) >= int(limit):
             break
-    first = not PROSPECTS.exists()
-    with open(PROSPECTS, "a", newline="", encoding="utf-8") as f:
-        w_ = csv.DictWriter(f, fieldnames=SOURCE_FIELDS)
-        if first:
-            w_.writeheader()
-        w_.writerows(new)
+    write_prospects(old_p + new)
     print(f"{len(new)} new {seg_name} from {place} ({cc}) via {provider}")
     return len(new)
 
@@ -709,7 +849,7 @@ def _retry_after(e):
         return 0
 
 
-TPM_LIMIT = int(os.getenv("GROQ_TPM", "7000"))  # free plan allows 8,000 tokens/min per model; keep a margin
+TPM_LIMIT = int(_env("GROQ_TPM", "7000"))  # free plan allows 8,000 tokens/min per model; keep a margin
 WINDOW = 60
 _USAGE = {}
 _RR = {"i": 0}
@@ -785,39 +925,51 @@ def make_followup(row, n):
         print("  follow-up failed:", str(e)[:100])
         return ""
     if text:
-        rows = load()
-        for r in rows:
-            if r["id"] == row["id"]:
-                r["followup1" if n == 0 else "followup2"] = text
-        save(rows)
+        with DBLOCK:
+            rows = load()
+            for r in rows:
+                if r["id"] == row["id"]:
+                    r["followup1" if n == 0 else "followup2"] = text
+            save(rows)
     return text
 
 
 # ------------------------------------------------------------------ DB
 def load():
-    if not DB.exists():
-        return []
-    with open(DB, newline="", encoding="utf-8") as f:
-        return list(csv.DictReader(f))
+    txt = STORE.read(DB)
+    return list(csv.DictReader(io.StringIO(txt, newline=""))) if txt else []
 
 
 def save(rows):
-    tmp = DB.with_suffix(".tmp")
-    with open(tmp, "w", newline="", encoding="utf-8") as f:
-        w = csv.DictWriter(f, fieldnames=FIELDS, extrasaction="ignore")
-        w.writeheader()
-        w.writerows(rows)
-    for _ in range(10):  # Windows can briefly lock the file while the app reads it
-        try:
-            os.replace(tmp, DB)
-            return
-        except PermissionError:
-            time.sleep(0.1)
-    os.replace(tmp, DB)
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=FIELDS, extrasaction="ignore", lineterminator="\n")
+    w.writeheader()
+    w.writerows(rows)
+    STORE.write(DB, buf.getvalue())
+
+
+def add_row(row):
+    with DBLOCK:  # reload first so a tap on 'Done' made while drafting is never overwritten
+        rows = load()
+        rows.append(row)
+        save(rows)
+
+
+def read_prospects():
+    txt = STORE.read(PROSPECTS)
+    return list(csv.DictReader(io.StringIO(txt, newline=""))) if txt else []
+
+
+def write_prospects(rows):
+    buf = io.StringIO()
+    w = csv.DictWriter(buf, fieldnames=SOURCE_FIELDS, extrasaction="ignore", lineterminator="\n")
+    w.writeheader()
+    w.writerows(rows)
+    STORE.write(PROSPECTS, buf.getvalue())
 
 
 def today():
-    return dt.date.today()
+    return now().date()
 
 
 JOB = {"running": False, "stage": "", "done": 0, "total": 0, "found": None, "drafted": 0, "error": "", "timings": {}}
@@ -860,7 +1012,7 @@ async def _pipeline(todo, rows, progress):
             return {**base, "fit_score": str(fit), "hook": d.get("hook", ""), "subject": subj,
                     "email_body": body, "whatsapp_msg": wa,
                     "followup1": d.get("followup1", ""), "followup2": d.get("followup2", ""),
-                    "mailto_link": mailto(email, subj, body), "whatsapp_link": wa_link(phone, wa),
+                    "mailto_link": "", "whatsapp_link": "",
                     "status": "new" if fit >= 3 else "nofit"}
 
         tasks = {asyncio.create_task(one(it)): it for it in todo}
@@ -873,22 +1025,20 @@ async def _pipeline(todo, rows, progress):
                 print("  skipped:", str(e)[:80])
                 row = None
             if row:
-                rows.append(row)
-                save(rows)  # drafts are usable immediately; nothing is lost on a crash
+                add_row(row)  # drafts are usable immediately; nothing is lost on a crash
             if progress:
                 progress(done, len(todo))
             print(f"[{done}/{len(todo)}]")
     return {"read websites": round(marks["fetch"], 1), "research + draft total": round(time.time() - t0, 1)}
 
 
-def cmd_generate(path=PROSPECTS, progress=None, max_new=None):
+def cmd_generate(path=None, progress=None, max_new=None):
     rows = load()
     seen = {r["id"] for r in rows}
-    if not Path(path).exists():
+    prospects = read_prospects()
+    if not prospects:
         print("No prospects file yet.")
         return {}
-    with open(path, newline="", encoding="utf-8") as f:
-        prospects = list(csv.DictReader(f))
     todo = []
     for p in prospects:
         cc = (p.get("country") or "").upper()
@@ -952,7 +1102,7 @@ def start_job(place, segment, limit, clear_first=True):
 def cmd_today():
     rows = load()
     sent_today = sum(1 for r in rows if r["sent_date"] == str(today()))
-    room = max(0, DAILY_CAP - sent_today)
+    room = max(0, get_cap() - sent_today)
     new = sorted([r for r in rows if r["status"] == "new"],
                  key=lambda r: -int(r["fit_score"] or 0))[:room]
     due = [r for r in rows if r["status"] == "sent" and r["next_action"]
@@ -961,13 +1111,13 @@ def cmd_today():
     for r in due:
         n = int(r["followups_sent"] or 0)
         print(f"\n[{r['id']}] {r['firm_name']}\n{r['followup1'] if n == 0 else r['followup2']}")
-    print(f"\n=== NEW SENDS (cap {DAILY_CAP}, {room} left): {len(new)} ===")
+    print(f"\n=== NEW SENDS (cap {get_cap()}, {room} left): {len(new)} ===")
     for r in new:
         print(f"\n[{r['id']}] {r['firm_name']} | fit {r['fit_score']} | hook: {r['hook']}")
-        if r["mailto_link"]:
-            print("EMAIL tap:", r["mailto_link"])
-        if r["whatsapp_link"]:
-            print("WHATSAPP tap:", r["whatsapp_link"])
+        if r["email"]:
+            print("EMAIL tap:", mailto(r["email"], r["subject"], r["email_body"]))
+        if r["phone"]:
+            print("WHATSAPP tap:", wa_link(r["phone"], r["whatsapp_msg"]))
 
 
 def cmd_sent(pid):
@@ -975,6 +1125,7 @@ def cmd_sent(pid):
     for r in rows:
         if pid.lower() not in (r["id"].lower(), r["email"].lower()):
             continue
+        r["last_logged"] = now().isoformat(timespec="seconds")
         if r["status"] == "new":
             r.update(status="sent", sent_date=str(today()), followups_sent="0",
                      next_action=str(today() + dt.timedelta(days=FOLLOWUP_DAYS[0])))
@@ -992,11 +1143,55 @@ def cmd_sent(pid):
     print("id not found")
 
 
+def cmd_undo(pid):
+    """Reverse the last 'Done, I sent it' for one business (first message or follow-up)."""
+    rows = load()
+    for r in rows:
+        if pid.lower() not in (r["id"].lower(), r["email"].lower()):
+            continue
+        n = int(r["followups_sent"] or 0)
+        if r["status"] == "sent" and n == 0:  # undo the first message: back into the queue
+            r.update(status="new", sent_date="", next_action="", last_logged="")
+        elif r["status"] in ("sent", "closed_no_reply") and r["sent_date"]:  # undo the last follow-up
+            n = max(n - 1, 0) if r["status"] == "closed_no_reply" or n > 0 else 0
+            base = dt.date.fromisoformat(r["sent_date"])
+            r.update(status="sent", followups_sent=str(n), last_logged="",
+                     next_action=str(base + dt.timedelta(days=FOLLOWUP_DAYS[min(n, len(FOLLOWUP_DAYS) - 1)])))
+        else:
+            print("nothing to undo")
+            return False
+        save(rows)
+        return True
+    return False
+
+
+def recent_logged(rows, hours=24):
+    """Businesses logged as sent in the last N hours, newest first (for the Undo list)."""
+    cutoff = now() - dt.timedelta(hours=hours)
+    out = []
+    for r in rows:
+        try:
+            if not r.get("last_logged") or r["status"] not in ("sent", "closed_no_reply"):
+                continue
+            t = dt.datetime.fromisoformat(r["last_logged"])
+            if t.tzinfo is None:
+                t = t.replace(tzinfo=TZ)
+            if t >= cutoff:
+                out.append(r)
+        except ValueError:
+            pass
+    return sorted(out, key=lambda r: r["last_logged"], reverse=True)
+
+
 def cmd_mark(pid, status):
     rows = load()
     for r in rows:
         if pid.lower() in (r["id"].lower(), r["email"].lower()):
-            r.update(status=status, next_action="")
+            nxt = ""
+            if status == "sent" and r["sent_date"]:  # restoring to 'sent' must bring the follow-up schedule back
+                k = min(int(r["followups_sent"] or 0), len(FOLLOWUP_DAYS) - 1)
+                nxt = str(dt.date.fromisoformat(r["sent_date"]) + dt.timedelta(days=FOLLOWUP_DAYS[k]))
+            r.update(status=status, next_action=nxt)
             save(rows)
             print("marked.")
             return
@@ -1029,6 +1224,18 @@ def cmd_stats():
             print(row)
 
 
+def _locked(fn):
+    def wrapper(*a, **k):
+        with DBLOCK:
+            return fn(*a, **k)
+    wrapper.__name__ = fn.__name__
+    return wrapper
+
+
+for _n in ("cmd_sent", "cmd_mark", "cmd_undo", "reset_queue"):
+    globals()[_n] = _locked(globals()[_n])
+
+
 if __name__ == "__main__":
     a = sys.argv[1:]
     if a[:1] == ["go"] and len(a) >= 3:
@@ -1038,6 +1245,7 @@ if __name__ == "__main__":
     elif a[:1] == ["today"]: cmd_today()
     elif a[:1] == ["sent"] and len(a) == 2: cmd_sent(a[1])
     elif a[:1] == ["mark"] and len(a) == 3: cmd_mark(a[1], a[2])
+    elif a[:1] == ["undo"] and len(a) == 2: print("undone." if cmd_undo(a[1]) else "nothing to undo")
     elif a[:1] == ["stats"]: cmd_stats()
     elif a[:1] == ["check"]: print("\n".join(check_keys()))
     elif a[:1] == ["segments"]: print("\n".join(SEGMENTS))

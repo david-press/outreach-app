@@ -5,6 +5,23 @@ import outreach as o
 
 st.set_page_config(page_title="Outreach", page_icon="📬", layout="centered")
 st.title("📬 Outreach")
+import hmac
+import os
+
+pw = o._env_key("APP_PASSWORD")
+if pw and not st.session_state.get("auth"):
+    entered = st.text_input("Password", type="password")
+    if entered and hmac.compare_digest(entered, pw):
+        st.session_state["auth"] = True
+        st.rerun()
+    elif entered:
+        st.error("Wrong password")
+    st.stop()
+
+if o.STORE.kind == "local disk" and os.path.exists("/mount/src"):
+    st.error("⚠️ This cloud app has no permanent storage yet: your sent-log, offers and follow-ups will be ERASED "
+             "when the app restarts. Set DATA_GITHUB_TOKEN and DATA_GITHUB_REPO in Secrets (see README).")
+
 
 # ------------------------------------------------------------ sidebar: find + draft
 def _job_status():
@@ -62,7 +79,12 @@ with st.sidebar:
     if st.button("🧹 Clear unsent queue", disabled=o.JOB["running"]):
         st.toast(f"Cleared {o.reset_queue()} unsent. History and follow-ups kept.")
         st.rerun()
-    st.caption(f"Daily send cap: {o.DAILY_CAP}")
+    cap = st.number_input("Daily limit for NEW messages", 1, 100, o.get_cap(),
+                          help="Follow-ups don't count. Raise it when you want to send more today.")
+    if int(cap) != o.get_cap():
+        o.set_cap(int(cap))
+    if cap > 15:
+        st.caption("Above ~15/day, cold WhatsApp from a fresh number can get flagged. Email is safer.")
     # keep the offer editor in sync with the chosen business type
     if st.session_state.get("offer_seg") != seg_name:
         st.session_state["offer_seg"] = seg_name
@@ -88,9 +110,9 @@ with st.sidebar:
             st.success("Saved. Applies to the next drafts.")
 
 rows = o.load()
-today = str(dt.date.today())
+today = str(o.today())
 sent_today = sum(1 for r in rows if r["sent_date"] == today)
-room = max(0, o.DAILY_CAP - sent_today)
+room = max(0, int(cap) - sent_today)
 new = sorted([r for r in rows if r["status"] == "new"],
              key=lambda r: -int(r["fit_score"] or 0))[:room]
 due = [r for r in rows if r["status"] == "sent" and r["next_action"] and r["next_action"] <= today]
@@ -99,7 +121,16 @@ t1, t2, t3, t4 = st.tabs([f"Send ({len(new)})", f"Follow-ups ({len(due)})", "Pip
 
 # ------------------------------------------------------------ send queue
 with t1:
-    st.caption(f"Sent today: {sent_today}/{o.DAILY_CAP}. Edit the text, tap send, then tap Done.")
+    st.caption(f"New messages sent today: {sent_today}/{int(cap)}. Edit the text, tap send, then tap Done.")
+    recent = o.recent_logged(rows)
+    if recent:
+        with st.expander(f"↩ Undo a mistaken 'Done' ({len(recent)} logged in the last 24h)"):
+            for r in recent:
+                kind = "first message" if r["followups_sent"] == "0" and r["status"] == "sent" else f"follow-up {r['followups_sent']}"
+                c1, c2 = st.columns([3, 1])
+                c1.write(f"**{r['firm_name']}** · {kind} · {r['last_logged'][11:16]}")
+                if c2.button("Undo", key=f"u{r['id']}"):
+                    o.cmd_undo(r["id"]); st.rerun()
     if not new:
         st.info("Nothing queued. Use 'Find & draft messages' in the sidebar.")
     for r in new:

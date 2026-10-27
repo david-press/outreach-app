@@ -45,3 +45,21 @@ German, Spanish, Portuguese or Italian for those countries, English otherwise
 
 ## Data
 Saved in `data/outreach.csv` (open in Excel/Sheets). Back it up.
+
+## Deploying on Streamlit Community Cloud (use it from your phone)
+
+Streamlit Cloud erases the app's files on every restart, and it has no `.env` file. So:
+
+1. **Never push `.env`.** It is git-ignored. If you ever pushed it, delete it from the repo
+   and create NEW keys at Groq / serper.dev / serpapi.com (old ones are exposed).
+2. **Permanent storage (required).** Create a second, PRIVATE GitHub repo, e.g. `outreach-data`
+   (tick "Add a README" so it has a `main` branch). Then GitHub > Settings > Developer settings >
+   Personal access tokens > Fine-grained tokens: access to ONLY that repo, permission
+   "Contents: Read and write". Copy the token.
+3. **Secrets.** App > Settings > Secrets: paste `.streamlit/secrets.toml.example` filled with your values
+   (Groq key, map key, `DATA_GITHUB_TOKEN`, `DATA_GITHUB_REPO`, `APP_PASSWORD`).
+4. **Private app.** App > Settings > Sharing: restrict viewing to your own email (and keep APP_PASSWORD set).
+5. Reboot the app, click **Test my keys**: it must show `Storage: OK (GitHub repo ...)`.
+
+Use ONE copy of the app at a time (cloud OR laptop), since they would not share data.
+Your day, daily limit and follow-up dates follow `APP_TZ` (default Africa/Lagos).

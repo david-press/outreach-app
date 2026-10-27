@@ -1,5 +1,7 @@
 .env
+ 
 .history
+.devcontainer
 .venv/
 data/
 __pycache__/
